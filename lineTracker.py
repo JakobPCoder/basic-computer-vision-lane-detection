@@ -3,6 +3,7 @@
 import os
 import time
 import keyboard
+import math
 import numpy as np
 import cv2
 from scipy.ndimage.filters import gaussian_filter
@@ -32,6 +33,8 @@ LANE_SEARCH_MAX_LANES = 6
 LANE_SEARCH_LANE_SEGMENTS = 32
 LANE_SEARCH_WIDTH = 24
 LANE_SEARCH_HEIGHT = 12
+
+LANE_FITTING_TEMPORL_SMOOTHING = 0.9  # between 0.01 and 0.99
 
 
 
@@ -105,7 +108,7 @@ def samplePolynomial2Deg(coefficients, start, end):
     return points
         
 
-    
+lastLineCoeffs = [[0, 0, BEV_W * 0.5], [0, 0, BEV_W * 0.5], [0, 0, BEV_W * 0.5]]   
     
 def findLines(lineMask, laneStartPositions):
     
@@ -180,17 +183,20 @@ def findLines(lineMask, laneStartPositions):
         lines.append(segments)
         
         
-        
+       
+           
+    global lastLineCoeffs     
         
 
     # fitting polynomial
         
     listOfLineCoeffs = []       
-    for line in listOfLinesFinal:
-        #line = listOfLinesFinal[0]
+    
+    for l in range(0, len(listOfLinesFinal)):
+        line = listOfLinesFinal[l]
         #print(line)
         
-        if len(line) > 3:
+        if len(line) > 2:
 
             xes = []
             yes = []
@@ -208,7 +214,11 @@ def findLines(lineMask, laneStartPositions):
             lineCoeffs = np.polyfit(turnedXes, turnedYes, 2)
             #lineCoeffs[2] = 0
             listOfLineCoeffs.append(lineCoeffs)
+            #print(type(lineCoeffs), np.shape(lineCoeffs), type(lineCoeffs[0]))
             #print(lineCoeffs)
+        elif l < len(lastLineCoeffs):
+            listOfLineCoeffs.append(lastLineCoeffs[l])
+                 
                  
         
     # averaging polynomial
@@ -224,6 +234,7 @@ def findLines(lineMask, laneStartPositions):
         b = line[1]
         
         weight = lineSignals[l]
+        weight  *= weight
         
         avgA += a * weight
         avgB += b * weight
@@ -237,7 +248,7 @@ def findLines(lineMask, laneStartPositions):
         
         for l in range(0, len(listOfLineCoeffs)):
             line = listOfLineCoeffs[l] 
-            weight = (lineSignals[l] / summedWeight)
+            weight = math.sqrt(lineSignals[l] / summedWeight)
             # #print(weightB)     
             
             blendedA = (line[0] * weight) + (avgA * (1.0 - weight))
@@ -249,15 +260,106 @@ def findLines(lineMask, laneStartPositions):
             
             
             
-    yValues = np.arange(0, BEV_H, 4, "float64")        
+        
+    
+    coefCopy = np.copy(listOfLineCoeffs)
+    tempWeight = 1.0 - LANE_FITTING_TEMPORL_SMOOTHING
+    
+    if len(coefCopy) == len(lastLineCoeffs):
+        
+        for l in range(0, len(coefCopy)):
+            line = coefCopy[l]
+            lineLast = lastLineCoeffs[l]
+                
+            
+            line[0] = (line[0] * tempWeight) + (lineLast[0] * (1.0 - tempWeight))
+            line[1] = (line[1] * tempWeight) + (lineLast[1] * (1.0 - tempWeight))
+            line[2] = (line[2] * tempWeight) + (lineLast[2] * (1.0 - tempWeight))
+            
+            listOfLineCoeffs[l] = line
+        
+    
+    
+    
+    
+    
+    lastLineCoeffs = np.copy(listOfLineCoeffs)
+    
+          
+    pointListList = []        
+    yValues = np.arange(0, BEV_H, 3, "float64")        
     for line in listOfLineCoeffs:       
-
+        
+        pointList = []
         xValues = np.polyval(line, yValues)      
         for i in range(0, len(yValues)):
-            x = BEV_W - xValues[i]
-            y = BEV_H - yValues[i]
-            cv2.circle(rgbMask, (int(x), int(y)), 1, (0, 255, 0), -1, lineType = cv2.LINE_AA)  
+            x = int(BEV_W - xValues[i])
+            y = int(BEV_H - yValues[i])
+            pointList.append([x, y])
+            
+            cv2.circle(rgbMask, (x, y), 1, (0, 255, 0), -1)  
+        pointListList.append(pointList)
+            
+            
+    FACTOR = 2
+    overlay = np.zeros_like(rgbMask)
+    overlay = cv2.resize(overlay, None, None, FACTOR, FACTOR)
+    
+    halfBevWidth = BEV_W * 0.5
+    closest = 999999
+    bestF = None
+    bestS = None
+
+    
+    for first, second in zip(pointListList, pointListList[1:]):
         
+        first = np.array(first) * FACTOR
+        second = np.array(second) * FACTOR
+        
+        flippedFirst = np.flip(first, 0)
+        both = np.append(flippedFirst, second, 0)
+        
+        cv2.fillPoly(overlay, pts = [both], color = (255, 60, 0))
+        
+        center = (first[0][0] + second[0][0]) * 0.5
+        
+        dist = abs(center - halfBevWidth)
+        if dist < closest:
+            closest = dist
+            bestF = np.copy(first)
+            bestS = np.copy(second)
+            
+    
+    if type(bestF) == np.ndarray:
+        
+        route = []
+        for first, second in zip(bestF, bestS):
+            avg = [(first[0] + second[0]) * 0.5, (first[1] + second[1]) * 0.5] 
+            route.append(avg)
+            cv2.circle(overlay, (int(avg[0]), int(avg[1])), 9, (0, 255, 0), -1, lineType = cv2.LINE_AA) 
+            
+    for line in pointListList:
+        line = np.array(line) * FACTOR
+        cv2.polylines(overlay, np.int32([line]), False, (0, 0, 255), 2, lineType = cv2.LINE_AA)    
+     
+         
+    overlay = cv2.resize(overlay, (BEV_W, BEV_H), cv2.INTER_AREA)    
+    overlay = cv2.GaussianBlur(overlay, (3, 3), 0)  
+        
+         
+    show(rgbMask, "5 - lane finding")   
+        
+    #show(overlay, "overlay Bev")
+    return overlay
+            
+    
+    
+    
+    
+    # contours = np.array([[50,50], [50,150], [150,150], [150,50]])
+    # image = np.zeros((200,200))
+    # cv2.fillPoly(image, pts = [contours], color =(255,255,255))
+            
             
 
      
@@ -307,8 +409,7 @@ def findLines(lineMask, laneStartPositions):
     #         cv2.circle(rgbMask, (int(point[1]), int(point[0])), 1, (0, 255, 0), -1)
             
         
-    
-    show(rgbMask, "rgbmaskktest")
+
     
   
     
@@ -327,14 +428,14 @@ class BirdsEyeView:
         
         
         top = self.sizeSource[0] * 0.63
-        bottom = self.sizeSource[0] * 0.9
+        bottom = self.sizeSource[0] * 0.90
         
         halfWidthTop = self.sizeSource[1] * 0.2 * fWidth
         halfWidthBottom = self.sizeSource[1] * 2.2 * fWidth
         
         
         targetTop = 0.0
-        targetBottom = 1.1
+        targetBottom = 1.0
         
         self.rectSource = np.float32([[centerX - halfWidthTop, top], [centerX + halfWidthTop, top], 
                         [centerX - halfWidthBottom, bottom], [centerX + halfWidthBottom, bottom]])
@@ -350,7 +451,7 @@ class BirdsEyeView:
         return cv2.warpPerspective(screen, self.matrixScreenToBird, (self.sizeTarget[0], self.sizeTarget[1]), flags = self.interp, borderMode = cv2.BORDER_DEFAULT)
 
     def getCamFrombird(self, screen):
-        return cv2.warpPerspective(screen, self.matrixBirdToScreen, (self.sizeSource[1], self.sizeSource[0]), flags = self.interp, borderMode = cv2.BORDER_DEFAULT)   
+        return cv2.warpPerspective(screen, self.matrixBirdToScreen, (self.sizeSource[1], self.sizeSource[0]), flags = self.interp, borderMode = cv2.BORDER_CONSTANT)   
 
 
 
@@ -449,7 +550,15 @@ while running:
         result = np.where(peaks > 0)
         #print(result[0], sep='\n')
         
-        lanePolys = findLines(bothLines, result)
+        laneOverlayBev = findLines(bothLines, result)
+        
+        laneOverlay = bevTransformer.getCamFrombird(laneOverlayBev)
+        
+        rgbOverlay = cv2.addWeighted(img, 1.0, laneOverlay, 0.5, 0)
+        
+        
+        show(rgbOverlay, "6 - laneOverlay")
+        
         
          
         # sobely = sobelPlusYellow(hls[:,:,2])
